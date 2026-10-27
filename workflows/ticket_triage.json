@@ -1,0 +1,579 @@
+{
+  "name": "TicketIQ - AI Ticket Triage",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "ticket",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "node-01",
+      "name": "Ticket Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        300
+      ],
+      "webhookId": "5b6f7c1e-9d3a-4c1b-8f55-2f7a1c9e0a11"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "\nconst body = $json.body || {};\nconst text = String(body.text || \"\").trim();\nreturn { json: {\n  ticket_id: String(body.ticket_id || (\"T-\" + Date.now())),\n  customer: String(body.customer || \"unknown\"),\n  text: text,\n  valid: text.length >= 3\n} };\n"
+      },
+      "id": "node-02",
+      "name": "Validate Input",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        220,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "cond-valid",
+              "leftValue": "={{ $json.valid }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "node-03",
+      "name": "Valid?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        440,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ ({ error: \"text must contain at least 3 characters\" }) }}",
+        "options": {
+          "responseCode": 400
+        }
+      },
+      "id": "node-04",
+      "name": "Respond 400",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        660,
+        480
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ ($env.TICKETIQ_API_URL || \"http://host.docker.internal:8000\") + \"/predict\" }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ text: $json.text }) }}",
+        "options": {
+          "timeout": 20000
+        }
+      },
+      "id": "node-05",
+      "name": "Classify (TicketIQ API)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        660,
+        200
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SLACK_WEBHOOK_URL }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ text: \"TicketIQ API unreachable. Ticket \" + $(\"Validate Input\").first().json.ticket_id + \" was not classified.\", content: \"TicketIQ API unreachable. Ticket \" + $(\"Validate Input\").first().json.ticket_id + \" was not classified.\" }) }}",
+        "options": {
+          "timeout": 20000
+        }
+      },
+      "id": "node-06",
+      "name": "Classifier Down Alert",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        880,
+        420
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO tickets (ticket_id, customer, text, route, needs_human_review) VALUES ($1, $2, $3, 'unclassified', TRUE) ON CONFLICT (ticket_id) DO UPDATE SET route = 'unclassified', needs_human_review = TRUE RETURNING id;",
+        "options": {
+          "queryReplacement": "={{ [ $(\"Validate Input\").first().json.ticket_id, $(\"Validate Input\").first().json.customer, $(\"Validate Input\").first().json.text ] }}"
+        }
+      },
+      "id": "node-07",
+      "name": "Log Unclassified",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        1100,
+        420
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ ({ error: \"classifier unavailable, ticket saved for manual triage\" }) }}",
+        "options": {
+          "responseCode": 503
+        }
+      },
+      "id": "node-08",
+      "name": "Respond 503",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1320,
+        420
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "\nconst t = $('Validate Input').first().json;\nconst r = $json;\nconst review = r.needs_human_review === true;\nconst priority = r.priority;\nconst slaByPriority = { High: \"Respond within 1 hour\", Medium: \"Respond within 8 hours\", Low: \"Respond within 24 hours\" };\nreturn { json: {\n  ticket_id: t.ticket_id,\n  customer: t.customer,\n  text: t.text,\n  intent: r.intent,\n  confidence: r.confidence,\n  priority: priority,\n  needs_human_review: review,\n  route: review ? \"human_review\" : String(priority).toLowerCase(),\n  sla: review ? \"Manual triage within 4 hours\" : slaByPriority[priority],\n  alert: review || priority === \"High\"\n} };\n"
+      },
+      "id": "node-09",
+      "name": "Build Routing",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        880,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.LLM_BASE_URL + \"/chat/completions\" }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ model: $env.LLM_MODEL, max_tokens: 160, temperature: 0.3, messages: [ { role: \"system\", content: \"You are a support agent for a digital bank. Write a short, polite first reply (max 3 sentences). Do not promise refunds, do not invent account details, do not ask for card numbers or passwords.\" }, { role: \"user\", content: \"Detected intent: \" + $json.intent + \"\\nCustomer message: \" + $json.text } ] }) }}",
+        "options": {
+          "timeout": 20000
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.LLM_API_KEY }}"
+            }
+          ]
+        }
+      },
+      "id": "node-10",
+      "name": "Draft Reply (LLM)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1100,
+        200
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "\nconst base = $('Build Routing').first().json;\nconst choice = $json.choices && $json.choices[0] && $json.choices[0].message;\nconst draft = String((choice && choice.content) || \"\").trim();\nconst flag = \"\";\nlet message = \"*\" + base.priority + \" priority ticket \" + base.ticket_id + \"*\"\n  + (base.needs_human_review ? \" (needs human review)\" : \"\")\n  + \"\\n*Intent:* \" + base.intent + \" (\" + Math.round(base.confidence * 100) + \"% confidence)\"\n  + \"\\n*SLA:* \" + base.sla\n  + \"\\n*Customer:* \" + base.customer\n  + \"\\n*Message:* \" + base.text;\nif (draft) { message += \"\\n*Suggested reply:* \" + draft; }\nreturn { json: Object.assign({}, base, { draft_reply: draft, alert_message: message.slice(0, 1800) }) };\n"
+      },
+      "id": "node-11",
+      "name": "Attach Draft",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1320,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO tickets (ticket_id, customer, text, intent, confidence, priority, needs_human_review, route, draft_reply) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) ON CONFLICT (ticket_id) DO UPDATE SET customer = EXCLUDED.customer, text = EXCLUDED.text, intent = EXCLUDED.intent, confidence = EXCLUDED.confidence, priority = EXCLUDED.priority, needs_human_review = EXCLUDED.needs_human_review, route = EXCLUDED.route, draft_reply = EXCLUDED.draft_reply RETURNING id;",
+        "options": {
+          "queryReplacement": "={{ [ $json.ticket_id, $json.customer, $json.text, $json.intent, $json.confidence, $json.priority, $json.needs_human_review, $json.route, $json.draft_reply ] }}"
+        }
+      },
+      "id": "node-12",
+      "name": "Log to Postgres",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        1540,
+        200
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "cond-needs-alert",
+              "leftValue": "={{ $(\"Attach Draft\").first().json.alert }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "node-13",
+      "name": "Needs Alert?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1760,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SLACK_WEBHOOK_URL }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ text: $(\"Attach Draft\").first().json.alert_message, content: $(\"Attach Draft\").first().json.alert_message }) }}",
+        "options": {
+          "timeout": 20000
+        }
+      },
+      "id": "node-14",
+      "name": "Send Alert (Slack/Discord)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1980,
+        100
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ (() => { const t = $(\"Attach Draft\").first().json; return { ticket_id: t.ticket_id, intent: t.intent, confidence: t.confidence, priority: t.priority, needs_human_review: t.needs_human_review, route: t.route, sla: t.sla, alerted: t.alert, draft_reply: t.draft_reply }; })() }}",
+        "options": {}
+      },
+      "id": "node-15",
+      "name": "Respond OK",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        2200,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 9 * * *"
+            }
+          ]
+        }
+      },
+      "id": "node-16",
+      "name": "Every day 9:00",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        760
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT COALESCE(priority, 'Unclassified') AS priority, COUNT(*) AS n, SUM(CASE WHEN needs_human_review THEN 1 ELSE 0 END) AS review FROM tickets WHERE created_at >= NOW() - INTERVAL '24 hours' GROUP BY 1 ORDER BY 1;",
+        "options": {}
+      },
+      "id": "node-17",
+      "name": "Daily Summary Query",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        220,
+        760
+      ],
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "\nconst rows = $input.all().map(i => i.json).filter(r => r.priority);\nconst total = rows.reduce((s, r) => s + Number(r.n), 0);\nlet msg = \"*TicketIQ daily summary (last 24h)*\\nTotal tickets: \" + total;\nfor (const r of rows) {\n  msg += \"\\n- \" + r.priority + \": \" + r.n + \" (sent to human review: \" + r.review + \")\";\n}\nif (!total) { msg += \"\\nNo tickets received.\"; }\nreturn [{ json: { message: msg } }];\n"
+      },
+      "id": "node-18",
+      "name": "Format Report",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        440,
+        760
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SLACK_WEBHOOK_URL }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ text: $json.message, content: $json.message }) }}",
+        "options": {
+          "timeout": 20000
+        }
+      },
+      "id": "node-19",
+      "name": "Send Daily Report",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        660,
+        760
+      ],
+      "onError": "continueRegularOutput"
+    }
+  ],
+  "connections": {
+    "Ticket Webhook": {
+      "main": [
+        [
+          {
+            "node": "Validate Input",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate Input": {
+      "main": [
+        [
+          {
+            "node": "Valid?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Valid?": {
+      "main": [
+        [
+          {
+            "node": "Classify (TicketIQ API)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond 400",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Classify (TicketIQ API)": {
+      "main": [
+        [
+          {
+            "node": "Build Routing",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Classifier Down Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Classifier Down Alert": {
+      "main": [
+        [
+          {
+            "node": "Log Unclassified",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log Unclassified": {
+      "main": [
+        [
+          {
+            "node": "Respond 503",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Routing": {
+      "main": [
+        [
+          {
+            "node": "Draft Reply (LLM)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Draft Reply (LLM)": {
+      "main": [
+        [
+          {
+            "node": "Attach Draft",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Attach Draft": {
+      "main": [
+        [
+          {
+            "node": "Log to Postgres",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log to Postgres": {
+      "main": [
+        [
+          {
+            "node": "Needs Alert?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Needs Alert?": {
+      "main": [
+        [
+          {
+            "node": "Send Alert (Slack/Discord)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond OK",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Alert (Slack/Discord)": {
+      "main": [
+        [
+          {
+            "node": "Respond OK",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Every day 9:00": {
+      "main": [
+        [
+          {
+            "node": "Daily Summary Query",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Daily Summary Query": {
+      "main": [
+        [
+          {
+            "node": "Format Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Report": {
+      "main": [
+        [
+          {
+            "node": "Send Daily Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Asia/Dhaka"
+  },
+  "pinData": {},
+  "tags": []
+}
